@@ -1,0 +1,206 @@
+// Pulse2MIDI 0.1
+// Diese Version fragt die Herzfrequenz ab und gibt sie als MIDI-Clock aus
+// -fragt die 3 (entprellten) Taster ab um Start,Stop und Continue zu senden
+// -fängt Fehler ab und nur bei gültigen Werten wird BPM geändert
+// -bessere Clock-Auflösung durch anderen Timer
+// -Zählen der Takte, Schläge und Clicks;
+// -Tempowechseln nur aller zwei Takte
+// -Statusmeldungen durch LED's mit Timer2
+
+#include <MIDI.h>      //Die MIDI-Library
+#include <Wire.h>      //Library für I2C
+#include <Bounce.h>    //Library zum Entprellen
+#include <TimerOne.h>  //Timer-Library
+#include <MsTimer2.h>  //Timer 2 für LED
+
+#define hrmi_Address 0x7F   //I2C Adresse von HRMI (keine Jumper = 127)
+#define hrmi_Baudrate 9600
+#define heart_data 3        //Anzahl der auszulesenden Werte + 2 Status Bytes
+
+#define KNOB1  0    //Drehregler
+#define KNOB2  1
+
+#define BUTTON1  2  //Schalter
+#define BUTTON2  3
+#define BUTTON3  4
+
+#define LED 13      //Standard-LED
+
+#define STAT1  7    //Status-LEDs
+#define STAT2  6
+
+byte StatusByte=0;
+int NewPulse=60;
+int OldPulse=60;
+int MemPulse=0;
+byte HeartRate[heart_data];
+byte NeuerWert = 0;
+byte LED_Var1 = 0;
+byte LED_Var2 = 0;
+
+Bounce bouncer1 = Bounce( BUTTON1,3 ); // Entprellte Tasten
+Bounce bouncer2 = Bounce( BUTTON2,3 );
+Bounce bouncer3 = Bounce( BUTTON3,3 );
+
+unsigned long TaktZaehler = 0;
+unsigned int ClockZaehler = 0;
+unsigned int BeatZaehler = 0;
+
+unsigned long Mem_TZ = 0;
+unsigned int Mem_CZ = 0;
+unsigned int Mem_BZ = 0;
+
+byte StopMode = 1;
+byte BeatChange = 0;
+
+void setup()  {
+
+  pinMode(BUTTON1,INPUT);
+  pinMode(BUTTON2,INPUT);
+  pinMode(BUTTON3,INPUT);
+  pinMode(STAT1,OUTPUT);
+  pinMode(STAT2,OUTPUT);
+  pinMode(LED, OUTPUT);
+  digitalWrite(BUTTON1,HIGH);
+  digitalWrite(BUTTON2,HIGH);
+  digitalWrite(BUTTON3,HIGH);
+
+  LED_flash();                      // flash MIDI Sheild LED's on startup
+
+  MIDI.begin();                     // MIDI initialisieren
+
+  //Serial.begin(9600); //Nur zur Fehlersuche
+
+  Timer1.initialize(41666);        // Timer1 mit 60 BPM starten
+  Timer1.attachInterrupt(MIDI_tick);
+
+  Wire.begin();                    //Arduino als Master am I2C Bus
+
+  MsTimer2::set(100, flash);        // 100ms period
+  MsTimer2::start();               // Timer für Status-LED
+
+}
+
+void loop()  {
+
+  /* Taster abfragen und entsprechene MIDI-Befehle senden und Zustände Ändern.*/
+  if ((bouncer1.update()) && (bouncer1.read() == HIGH) && (StopMode)) {
+        MIDI.sendRealTime(Start);
+        TaktZaehler = 0;
+        ClockZaehler = 0;
+        BeatZaehler = 0;
+        StopMode = 0;
+  }
+
+  if ((bouncer2.update()) && (bouncer2.read() == HIGH)) {
+      MIDI.sendRealTime(Stop);
+      if (!(StopMode)) {
+        Mem_TZ = TaktZaehler;
+        Mem_CZ = ClockZaehler;
+        Mem_BZ = BeatZaehler;
+        StopMode = 1;
+      }
+  }
+  if ((bouncer3.update()) && (bouncer3.read() == HIGH) && (StopMode)) {
+        MIDI.sendRealTime(Continue);
+        TaktZaehler = Mem_TZ;
+        ClockZaehler = Mem_CZ;
+        BeatZaehler = Mem_BZ;
+        StopMode = 0;
+  }
+
+  if ((NeuerWert) && (BeatChange) && (!(TaktZaehler % 2))) {
+      set_BPM(MemPulse);
+      NeuerWert = 0;
+      BeatChange = 0;
+      if (LED_Var1 == 0)LED_Var1 = 1;
+  }
+
+  Wire.beginTransmission(hrmi_Address);
+  Wire.write(0x47);                          //Get Heart Rate
+  Wire.write(heart_data);
+  Wire.endTransmission();
+
+  Wire.requestFrom(hrmi_Address, heart_data);
+  if (Wire.available()) {                    //Daten von HRMI empfangen
+    for (int i = 0; i < heart_data; i++){
+      HeartRate[i] = Wire.read();
+    }
+    StatusByte=HeartRate[0];
+    NewPulse=HeartRate[2];
+
+    /* Statusbyte:
+    Bit 0: 1=average 0=raw
+    Bit 1: 1=no Data 0= OK
+    Bit 2: 1= 25% Abweichung 0=durschnittlicher Modus
+    Bit 3: 1=bad Data 0= OK
+    */
+
+    if ((StatusByte & 1) && (NewPulse != 0) && (!(StatusByte & 2)) && (!(StatusByte & 4)) && (!(StatusByte & 8))) {
+      if (OldPulse != NewPulse) {
+        MemPulse = NewPulse;
+        OldPulse = NewPulse;
+        NeuerWert = 1;
+        if (LED_Var2 == 0) LED_Var2 = 1;
+      }
+    }
+  }
+}  //void loop
+
+//MIDI-Tick (24*Beat) senden (Die Timer-Interrupt-Routine)
+void MIDI_tick() {
+  MIDI.sendRealTime(Clock);  //sende ein MIDI-Clock-Befehl
+  ClockZaehler++;
+  if (ClockZaehler == 24) {
+    BeatZaehler++;
+    ClockZaehler = 0;
+    if (BeatZaehler == 4){
+      TaktZaehler++;
+      BeatZaehler = 0;
+      BeatChange = 1;
+    }
+  }
+}
+
+// BPM setzen (timer programmieren)
+void set_BPM(int BPM) {
+  unsigned long NewTime;
+  float BPM_Calc = BPM;
+  NewTime = (unsigned long)(1/((BPM_Calc*24)/60000000));
+  Timer1.setPeriod(NewTime);
+}
+
+// Die LED-Status-LED Anzeige- Timer Interrupt-Routine
+void flash() {
+    if (LED_Var1 != 0) {
+        if (LED_Var1 == 1) digitalWrite(STAT1, LOW);
+        if (LED_Var1 == 3) {
+            digitalWrite(STAT1, HIGH);
+            LED_Var1 = 0;
+        }
+        else LED_Var1++;
+    }
+
+    if (LED_Var2 != 0) {
+        if (LED_Var2 == 1) digitalWrite(STAT2, LOW);
+        if (LED_Var2 == 4) {
+            digitalWrite(STAT2, HIGH);
+            LED_Var2 = 0;
+        }
+        else LED_Var2++;
+    }
+}
+
+// LEDs flackern lassen
+void LED_flash(void) {
+  for(int i = 0;i < 10;i++) {
+    digitalWrite(STAT1,HIGH);
+    digitalWrite(STAT2,LOW);
+    delay(30);
+    digitalWrite(STAT1,LOW);
+    digitalWrite(STAT2,HIGH);
+    delay(30);
+  }
+  digitalWrite(STAT1,HIGH);
+  digitalWrite(STAT2,HIGH);
+}
